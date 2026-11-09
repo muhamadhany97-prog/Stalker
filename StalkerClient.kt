@@ -12,7 +12,7 @@ data class Channel(val name: String, val cmd: String)
 data class Account(val expiry: String, val daysLeft: Long?)
 
 class StalkerClient(portal: String, private val mac: String) {
-    private val http = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
+    private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
     private val endpoints: List<String>
     private var endpoint = ""
     private var token = ""
@@ -33,25 +33,33 @@ class StalkerClient(portal: String, private val mac: String) {
             .apply { if (token.isNotEmpty()) header("Authorization", "Bearer $token") }
             .build()
         http.newCall(req).execute().use { r ->
-            val body = r.body?.string() ?: return null
-            return runCatching { JSONObject(body).optJSONObject("js") }.getOrNull()
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw java.io.IOException("HTTP ${r.code}")
+            val js = runCatching { JSONObject(body).optJSONObject("js") }.getOrNull()
+            if (js == null && query.contains("handshake")) throw java.io.IOException("رد غير صالح: " + body.take(80).replace("\n", " "))
+            return js
         }
     }
 
     /** تسجيل الدخول: handshake + get_profile */
     fun login() {
+        val errors = mutableListOf<String>()
         for (ep in endpoints) {
-            val js = runCatching { call("type=stb&action=handshake&token=", ep) }.getOrNull()
-            val t = js?.optString("token").orEmpty()
-            if (t.isNotEmpty()) { endpoint = ep; token = t; break }
+            try {
+                val t = call("type=stb&action=handshake&token=", ep)?.optString("token").orEmpty()
+                if (t.isNotEmpty()) { endpoint = ep; token = t; break }
+                errors += "${ep.substringAfter("//")}: لا يوجد token"
+            } catch (e: Exception) {
+                errors += "${ep.substringAfter("//")}: ${e.message ?: e.javaClass.simpleName}"
+            }
         }
-        if (endpoint.isEmpty()) error("تعذر الاتصال بالبورتال أو MAC غير صحيح")
-        call("type=stb&action=get_profile&hd=1&ver=ImageDescription:%200.2.18-r14-pub-250;&num_banks=2&stb_type=MAG250&client_type=STB&image_version=218&video_out=hdmi&auth_second_step=1&not_valid_token=0")
+        if (endpoint.isEmpty()) error("فشل handshake\n" + errors.joinToString("\n"))
+        runCatching { call("type=stb&action=get_profile&hd=1&ver=ImageDescription:%200.2.18-r14-pub-250;&num_banks=2&stb_type=MAG250&client_type=STB&image_version=218&video_out=hdmi&auth_second_step=1&not_valid_token=0") }
     }
 
     /** تاريخ انتهاء الاشتراك */
     fun account(): Account {
-        val js = call("type=account_info&action=get_main_info")
+        val js = runCatching { call("type=account_info&action=get_main_info") }.getOrNull()
         val raw = listOf("end_date", "expire_billing_date", "phone").map { js?.optString(it).orEmpty() }
             .firstOrNull { it.isNotBlank() && it != "0000-00-00 00:00:00" } ?: "غير محدد"
         val days = runCatching {
@@ -69,15 +77,16 @@ class StalkerClient(portal: String, private val mac: String) {
             if (arr == null) return
             for (i in 0 until arr.length()) arr.getJSONObject(i).let { out += Channel(it.optString("name"), it.optString("cmd")) }
         }
-        parse(call("type=itv&action=get_all_channels")?.optJSONArray("data"))
+        runCatching { parse(call("type=itv&action=get_all_channels")?.optJSONArray("data")) }
         if (out.isEmpty()) { // بعض البورتالات تدعم الصفحات فقط
             for (p in 1..40) {
-                val js = call("type=itv&action=get_ordered_list&genre=*&force_ch_link_check=&fav=0&sortby=number&hd=0&p=$p") ?: break
+                val js = runCatching { call("type=itv&action=get_ordered_list&genre=*&force_ch_link_check=&fav=0&sortby=number&hd=0&p=$p") }.getOrNull() ?: break
                 val before = out.size
                 parse(js.optJSONArray("data"))
                 if (out.size == before) break
             }
         }
+        if (out.isEmpty()) error("تم الدخول لكن لا توجد قنوات (قد يكون الاشتراك منتهياً أو MAC غير مفعّل)")
         return out
     }
 
